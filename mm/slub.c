@@ -259,7 +259,7 @@ static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
 	 * freepointer to be restored incorrectly.
 	 */
 	return (void *)((unsigned long)ptr ^ s->random ^
-			(unsigned long)kasan_reset_tag((void *)ptr_addr));
+			swab((unsigned long)kasan_reset_tag((void *)ptr_addr)));
 #else
 	return ptr;
 #endif
@@ -449,6 +449,7 @@ static DEFINE_SPINLOCK(object_map_lock);
  * not vanish from under us.
  */
 static unsigned long *get_map(struct kmem_cache *s, struct page *page)
+	__acquires(&object_map_lock)
 {
 	void *p;
 	void *addr = page_address(page);
@@ -465,7 +466,7 @@ static unsigned long *get_map(struct kmem_cache *s, struct page *page)
 	return object_map;
 }
 
-static void put_map(unsigned long *map)
+static void put_map(unsigned long *map) __releases(&object_map_lock)
 {
 	VM_BUG_ON(map != object_map);
 	lockdep_assert_held(&object_map_lock);
@@ -550,15 +551,32 @@ static void print_section(char *level, char *text, u8 *addr,
 	metadata_access_disable();
 }
 
+/*
+ * See comment in calculate_sizes().
+ */
+static inline bool freeptr_outside_object(struct kmem_cache *s)
+{
+	return s->offset >= s->inuse;
+}
+
+/*
+ * Return offset of the end of info block which is inuse + free pointer if
+ * not overlapping with object.
+ */
+static inline unsigned int get_info_end(struct kmem_cache *s)
+{
+	if (freeptr_outside_object(s))
+		return s->inuse + sizeof(void *);
+	else
+		return s->inuse;
+}
+
 static struct track *get_track(struct kmem_cache *s, void *object,
 	enum track_item alloc)
 {
 	struct track *p;
 
-	if (s->offset)
-		p = object + s->offset + sizeof(void *);
-	else
-		p = object + s->inuse;
+	p = object + get_info_end(s);
 
 	return p + alloc;
 }
@@ -661,6 +679,20 @@ static void slab_fix(struct kmem_cache *s, char *fmt, ...)
 	va_end(args);
 }
 
+static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
+			       void *freelist, void *nextfree)
+{
+	if ((s->flags & SLAB_CONSISTENCY_CHECKS) &&
+	    !check_valid_pointer(s, page, nextfree)) {
+		object_err(s, page, freelist, "Freechain corrupt");
+		freelist = NULL;
+		slab_fix(s, "Isolate corrupted freechain");
+		return true;
+	}
+
+	return false;
+}
+
 static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 {
 	unsigned int off;	/* Offset of last byte */
@@ -685,10 +717,7 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 		print_section(KERN_ERR, "Redzone ", p + s->object_size,
 			s->inuse - s->object_size);
 
-	if (s->offset)
-		off = s->offset + sizeof(void *);
-	else
-		off = s->inuse;
+	off = get_info_end(s);
 
 	if (s->flags & SLAB_STORE_USER)
 		off += 2 * sizeof(struct track);
@@ -781,7 +810,7 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
  * object address
  * 	Bytes of the object to be managed.
  * 	If the freepointer may overlay the object then the free
- * 	pointer is the first word of the object.
+ *	pointer is at the middle of the object.
  *
  * 	Poisoning uses 0x6b (POISON_FREE) and the last byte is
  * 	0xa5 (POISON_END)
@@ -815,11 +844,7 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 
 static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 {
-	unsigned long off = s->inuse;	/* The end of info */
-
-	if (s->offset)
-		/* Freepointer is placed after the object. */
-		off += sizeof(void *);
+	unsigned long off = get_info_end(s);	/* The end of info */
 
 	if (s->flags & SLAB_STORE_USER)
 		/* We also have user information there */
@@ -906,7 +931,7 @@ static int check_object(struct kmem_cache *s, struct page *page,
 		check_pad_bytes(s, page, p);
 	}
 
-	if (!s->offset && val == SLUB_RED_ACTIVE)
+	if (!freeptr_outside_object(s) && val == SLUB_RED_ACTIVE)
 		/*
 		 * Object and freepointer overlap. Cannot check
 		 * freepointer while object is allocated.
@@ -1399,6 +1424,11 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node,
 static inline void dec_slabs_node(struct kmem_cache *s, int node,
 							int objects) {}
 
+static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
+			       void *freelist, void *nextfree)
+{
+	return false;
+}
 #endif /* CONFIG_SLUB_DEBUG */
 
 /*
@@ -2082,6 +2112,14 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
 		void *prior;
 		unsigned long counters;
 
+		/*
+		 * If 'nextfree' is invalid, it is possible that the object at
+		 * 'freelist' is already corrupted.  So isolate all objects
+		 * starting at 'freelist'.
+		 */
+		if (freelist_corrupted(s, page, freelist, nextfree))
+			break;
+
 		do {
 			prior = page->freelist;
 			counters = page->counters;
@@ -2205,11 +2243,11 @@ static void unfreeze_partials(struct kmem_cache *s,
 	struct kmem_cache_node *n = NULL, *n2 = NULL;
 	struct page *page, *discard_page = NULL;
 
-	while ((page = c->partial)) {
+	while ((page = slub_percpu_partial(c))) {
 		struct page new;
 		struct page old;
 
-		c->partial = page->next;
+		slub_set_percpu_partial(c, page);
 
 		n2 = get_node(s, page_to_nid(page));
 		if (n != n2) {
@@ -2282,7 +2320,7 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 		if (oldpage) {
 			pobjects = oldpage->pobjects;
 			pages = oldpage->pages;
-			if (drain && pobjects > s->cpu_partial) {
+			if (drain && pobjects > slub_cpu_partial(s)) {
 				unsigned long flags;
 				/*
 				 * partial array is full. Move the existing
@@ -2307,7 +2345,7 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 
 	} while (this_cpu_cmpxchg(s->cpu_slab->partial, oldpage, page)
 								!= oldpage);
-	if (unlikely(!s->cpu_partial)) {
+	if (unlikely(!slub_cpu_partial(s))) {
 		unsigned long flags;
 
 		local_irq_save(flags);
@@ -3512,15 +3550,15 @@ static void set_cpu_partial(struct kmem_cache *s)
 	 *    50% to keep some capacity around for frees.
 	 */
 	if (!kmem_cache_has_cpu_partial(s))
-		s->cpu_partial = 0;
+		slub_set_cpu_partial(s, 0);
 	else if (s->size >= PAGE_SIZE)
-		s->cpu_partial = 2;
+		slub_set_cpu_partial(s, 2);
 	else if (s->size >= 1024)
-		s->cpu_partial = 6;
+		slub_set_cpu_partial(s, 6);
 	else if (s->size >= 256)
-		s->cpu_partial = 13;
+		slub_set_cpu_partial(s, 13);
 	else
-		s->cpu_partial = 30;
+		slub_set_cpu_partial(s, 30);
 #endif
 }
 
@@ -3532,6 +3570,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 {
 	slab_flags_t flags = s->flags;
 	unsigned int size = s->object_size;
+	unsigned int freepointer_area;
 	unsigned int order;
 
 	/*
@@ -3540,6 +3579,13 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * the possible location of the free pointer.
 	 */
 	size = ALIGN(size, sizeof(void *));
+	/*
+	 * This is the area of the object where a freepointer can be
+	 * safely written. If redzoning adds more to the inuse size, we
+	 * can't use that portion for writing the freepointer, so
+	 * s->offset must be limited within this for the general case.
+	 */
+	freepointer_area = size;
 
 #ifdef CONFIG_SLUB_DEBUG
 	/*
@@ -3578,9 +3624,21 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 *
 		 * This is the case if we do RCU, have a constructor or
 		 * destructor or are poisoning the objects.
+		 *
+		 * The assumption that s->offset >= s->inuse means free
+		 * pointer is outside of the object is used in the
+		 * freeptr_outside_object() function. If that is no
+		 * longer true, the function needs to be modified.
 		 */
 		s->offset = size;
 		size += sizeof(void *);
+	} else if (freepointer_area > sizeof(void *)) {
+		/*
+		 * Store freelist pointer near middle of object to keep
+		 * it away from the edges of the object to avoid small
+		 * sized over/underflows from neighboring allocations.
+		 */
+		s->offset = ALIGN(freepointer_area / 2, sizeof(void *));
 	}
 
 #ifdef CONFIG_SLUB_DEBUG
@@ -5623,7 +5681,8 @@ static void memcg_propagate_slab_attrs(struct kmem_cache *s)
 		 */
 		if (buffer)
 			buf = buffer;
-		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf))
+		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf) &&
+			 !IS_ENABLED(CONFIG_SLUB_STATS))
 			buf = mbuf;
 		else {
 			buffer = (char *) get_zeroed_page(GFP_KERNEL);
@@ -5778,8 +5837,10 @@ static int sysfs_slab_add(struct kmem_cache *s)
 
 	s->kobj.kset = kset;
 	err = kobject_init_and_add(&s->kobj, &slab_ktype, NULL, "%s", name);
-	if (err)
+	if (err) {
+		kobject_put(&s->kobj);
 		goto out;
+	}
 
 	err = sysfs_create_group(&s->kobj, &slab_attr_group);
 	if (err)

@@ -829,6 +829,29 @@ wq_error:
 }
 
 /**
+ * destroy_workqueues - destroy per port workqueues
+ * @dd: the hfi1_ib device
+ */
+static void destroy_workqueues(struct hfi1_devdata *dd)
+{
+	int pidx;
+	struct hfi1_pportdata *ppd;
+
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+
+		if (ppd->hfi1_wq) {
+			destroy_workqueue(ppd->hfi1_wq);
+			ppd->hfi1_wq = NULL;
+		}
+		if (ppd->link_wq) {
+			destroy_workqueue(ppd->link_wq);
+			ppd->link_wq = NULL;
+		}
+	}
+}
+
+/**
  * enable_general_intr() - Enable the IRQs that will be handled by the
  * general interrupt handler.
  * @dd: valid devdata
@@ -1101,15 +1124,10 @@ static void shutdown_device(struct hfi1_devdata *dd)
 		 * We can't count on interrupts since we are stopping.
 		 */
 		hfi1_quiet_serdes(ppd);
-
-		if (ppd->hfi1_wq) {
-			destroy_workqueue(ppd->hfi1_wq);
-			ppd->hfi1_wq = NULL;
-		}
-		if (ppd->link_wq) {
-			destroy_workqueue(ppd->link_wq);
-			ppd->link_wq = NULL;
-		}
+		if (ppd->hfi1_wq)
+			flush_workqueue(ppd->hfi1_wq);
+		if (ppd->link_wq)
+			flush_workqueue(ppd->link_wq);
 	}
 	sdma_exit(dd);
 }
@@ -1198,13 +1216,13 @@ static void finalize_asic_data(struct hfi1_devdata *dd,
 }
 
 /**
- * hfi1_clean_devdata - cleans up per-unit data structure
+ * hfi1_free_devdata - cleans up and frees per-unit data structure
  * @dd: pointer to a valid devdata structure
  *
- * It cleans up all data structures set up by
+ * It cleans up and frees all data structures set up by
  * by hfi1_alloc_devdata().
  */
-static void hfi1_clean_devdata(struct hfi1_devdata *dd)
+void hfi1_free_devdata(struct hfi1_devdata *dd)
 {
 	struct hfi1_asic_data *ad;
 	unsigned long flags;
@@ -1229,23 +1247,6 @@ static void hfi1_clean_devdata(struct hfi1_devdata *dd)
 	dd->comp_vect = NULL;
 	sdma_clean(dd, dd->num_sdma);
 	rvt_dealloc_device(&dd->verbs_dev.rdi);
-}
-
-static void __hfi1_free_devdata(struct kobject *kobj)
-{
-	struct hfi1_devdata *dd =
-		container_of(kobj, struct hfi1_devdata, kobj);
-
-	hfi1_clean_devdata(dd);
-}
-
-static struct kobj_type hfi1_devdata_type = {
-	.release = __hfi1_free_devdata,
-};
-
-void hfi1_free_devdata(struct hfi1_devdata *dd)
-{
-	kobject_put(&dd->kobj);
 }
 
 /**
@@ -1333,11 +1334,10 @@ static struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev,
 		goto bail;
 	}
 
-	kobject_init(&dd->kobj, &hfi1_devdata_type);
 	return dd;
 
 bail:
-	hfi1_clean_devdata(dd);
+	hfi1_free_devdata(dd);
 	return ERR_PTR(ret);
 }
 
@@ -1775,6 +1775,7 @@ static void remove_one(struct pci_dev *pdev)
 	 * clear dma engines, etc.
 	 */
 	shutdown_device(dd);
+	destroy_workqueues(dd);
 
 	stop_timers(dd);
 

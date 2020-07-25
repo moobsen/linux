@@ -62,6 +62,13 @@ int idxd_unmask_msix_vector(struct idxd_device *idxd, int vec_id)
 	perm.ignore = 0;
 	iowrite32(perm.bits, idxd->reg_base + offset);
 
+	/*
+	 * A readback from the device ensures that any previously generated
+	 * completion record writes are visible to software based on PCI
+	 * ordering rules.
+	 */
+	perm.bits = ioread32(idxd->reg_base + offset);
+
 	return 0;
 }
 
@@ -311,6 +318,31 @@ void idxd_wq_unmap_portal(struct idxd_wq *wq)
 	struct device *dev = &wq->idxd->pdev->dev;
 
 	devm_iounmap(dev, wq->dportal);
+}
+
+void idxd_wq_disable_cleanup(struct idxd_wq *wq)
+{
+	struct idxd_device *idxd = wq->idxd;
+	struct device *dev = &idxd->pdev->dev;
+	int i, wq_offset;
+
+	lockdep_assert_held(&idxd->dev_lock);
+	memset(&wq->wqcfg, 0, sizeof(wq->wqcfg));
+	wq->type = IDXD_WQT_NONE;
+	wq->size = 0;
+	wq->group = NULL;
+	wq->threshold = 0;
+	wq->priority = 0;
+	clear_bit(WQ_FLAG_DEDICATED, &wq->flags);
+	memset(wq->name, 0, WQ_NAME_SIZE);
+
+	for (i = 0; i < 8; i++) {
+		wq_offset = idxd->wqcfg_offset + wq->id * 32 + i * sizeof(u32);
+		iowrite32(0, idxd->reg_base + wq_offset);
+		dev_dbg(dev, "WQ[%d][%d][%#x]: %#x\n",
+			wq->id, i, wq_offset,
+			ioread32(idxd->reg_base + wq_offset));
+	}
 }
 
 /* Device control bits */
@@ -584,11 +616,11 @@ static void idxd_group_flags_setup(struct idxd_device *idxd)
 		struct idxd_group *group = &idxd->groups[i];
 
 		if (group->tc_a == -1)
-			group->grpcfg.flags.tc_a = 0;
+			group->tc_a = group->grpcfg.flags.tc_a = 0;
 		else
 			group->grpcfg.flags.tc_a = group->tc_a;
 		if (group->tc_b == -1)
-			group->grpcfg.flags.tc_b = 1;
+			group->tc_b = group->grpcfg.flags.tc_b = 1;
 		else
 			group->grpcfg.flags.tc_b = group->tc_b;
 		group->grpcfg.flags.use_token_limit = group->use_token_limit;

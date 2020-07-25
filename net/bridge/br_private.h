@@ -217,8 +217,8 @@ struct net_bridge_port_group {
 	struct rcu_head			rcu;
 	struct timer_list		timer;
 	struct br_ip			addr;
+	unsigned char			eth_addr[ETH_ALEN] __aligned(2);
 	unsigned char			flags;
-	unsigned char			eth_addr[ETH_ALEN];
 };
 
 struct net_bridge_mdb_entry {
@@ -1199,8 +1199,8 @@ static inline void br_vlan_notify(const struct net_bridge *br,
 
 /* br_vlan_options.c */
 #ifdef CONFIG_BRIDGE_VLAN_FILTERING
-bool br_vlan_opts_eq(const struct net_bridge_vlan *v1,
-		     const struct net_bridge_vlan *v2);
+bool br_vlan_opts_eq_range(const struct net_bridge_vlan *v_curr,
+			   const struct net_bridge_vlan *range_end);
 bool br_vlan_opts_fill(struct sk_buff *skb, const struct net_bridge_vlan *v);
 size_t br_vlan_opts_nl_size(void);
 int br_vlan_process_options(const struct net_bridge *br,

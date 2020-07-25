@@ -354,9 +354,13 @@ smb2_get_data_area_len(int *off, int *len, struct smb2_sync_hdr *shdr)
 		  ((struct smb2_ioctl_rsp *)shdr)->OutputCount);
 		break;
 	case SMB2_CHANGE_NOTIFY:
+		*off = le16_to_cpu(
+		  ((struct smb2_change_notify_rsp *)shdr)->OutputBufferOffset);
+		*len = le32_to_cpu(
+		  ((struct smb2_change_notify_rsp *)shdr)->OutputBufferLength);
+		break;
 	default:
-		/* BB FIXME for unimplemented cases above */
-		cifs_dbg(VFS, "no length check for command\n");
+		cifs_dbg(VFS, "no length check for command %d\n", le16_to_cpu(shdr->Command));
 		break;
 	}
 
@@ -766,6 +770,20 @@ smb2_handle_cancelled_close(struct cifs_tcon *tcon, __u64 persistent_fid,
 
 	cifs_dbg(FYI, "%s: tc_count=%d\n", __func__, tcon->tc_count);
 	spin_lock(&cifs_tcp_ses_lock);
+	if (tcon->tc_count <= 0) {
+		struct TCP_Server_Info *server = NULL;
+
+		WARN_ONCE(tcon->tc_count < 0, "tcon refcount is negative");
+		spin_unlock(&cifs_tcp_ses_lock);
+
+		if (tcon->ses)
+			server = tcon->ses->server;
+
+		cifs_server_dbg(FYI, "tid=%u: tcon is closing, skipping async close retry of fid %llu %llu\n",
+				tcon->tid, persistent_fid, volatile_fid);
+
+		return 0;
+	}
 	tcon->tc_count++;
 	spin_unlock(&cifs_tcp_ses_lock);
 

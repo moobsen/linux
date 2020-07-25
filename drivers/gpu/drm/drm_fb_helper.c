@@ -227,6 +227,42 @@ int drm_fb_helper_debug_leave(struct fb_info *info)
 }
 EXPORT_SYMBOL(drm_fb_helper_debug_leave);
 
+static int
+__drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper,
+					    bool force)
+{
+	bool do_delayed;
+	int ret;
+
+	if (!drm_fbdev_emulation || !fb_helper)
+		return -ENODEV;
+
+	if (READ_ONCE(fb_helper->deferred_setup))
+		return 0;
+
+	mutex_lock(&fb_helper->lock);
+	if (force) {
+		/*
+		 * Yes this is the _locked version which expects the master lock
+		 * to be held. But for forced restores we're intentionally
+		 * racing here, see drm_fb_helper_set_par().
+		 */
+		ret = drm_client_modeset_commit_locked(&fb_helper->client);
+	} else {
+		ret = drm_client_modeset_commit(&fb_helper->client);
+	}
+
+	do_delayed = fb_helper->delayed_hotplug;
+	if (do_delayed)
+		fb_helper->delayed_hotplug = false;
+	mutex_unlock(&fb_helper->lock);
+
+	if (do_delayed)
+		drm_fb_helper_hotplug_event(fb_helper);
+
+	return ret;
+}
+
 /**
  * drm_fb_helper_restore_fbdev_mode_unlocked - restore fbdev configuration
  * @fb_helper: driver-allocated fbdev helper, can be NULL
@@ -240,37 +276,7 @@ EXPORT_SYMBOL(drm_fb_helper_debug_leave);
  */
 int drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper)
 {
-	bool do_delayed;
-	int ret;
-
-	if (!drm_fbdev_emulation || !fb_helper)
-		return -ENODEV;
-
-	if (READ_ONCE(fb_helper->deferred_setup))
-		return 0;
-
-	mutex_lock(&fb_helper->lock);
-	/*
-	 * TODO:
-	 * We should bail out here if there is a master by dropping _force.
-	 * Currently these igt tests fail if we do that:
-	 * - kms_fbcon_fbt@psr
-	 * - kms_fbcon_fbt@psr-suspend
-	 *
-	 * So first these tests need to be fixed so they drop master or don't
-	 * have an fd open.
-	 */
-	ret = drm_client_modeset_commit_force(&fb_helper->client);
-
-	do_delayed = fb_helper->delayed_hotplug;
-	if (do_delayed)
-		fb_helper->delayed_hotplug = false;
-	mutex_unlock(&fb_helper->lock);
-
-	if (do_delayed)
-		drm_fb_helper_hotplug_event(fb_helper);
-
-	return ret;
+	return __drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper, false);
 }
 EXPORT_SYMBOL(drm_fb_helper_restore_fbdev_mode_unlocked);
 
@@ -294,7 +300,7 @@ static bool drm_fb_helper_force_kernel_mode(void)
 			continue;
 
 		mutex_lock(&helper->lock);
-		ret = drm_client_modeset_commit_force(&helper->client);
+		ret = drm_client_modeset_commit_locked(&helper->client);
 		if (ret)
 			error = true;
 		mutex_unlock(&helper->lock);
@@ -460,7 +466,6 @@ EXPORT_SYMBOL(drm_fb_helper_prepare);
  * drm_fb_helper_init - initialize a &struct drm_fb_helper
  * @dev: drm device
  * @fb_helper: driver-allocated fbdev helper structure to initialize
- * @max_conn_count: max connector count (not used)
  *
  * This allocates the structures for the fbdev helper with the given limits.
  * Note that this won't yet touch the hardware (through the driver interfaces)
@@ -473,8 +478,7 @@ EXPORT_SYMBOL(drm_fb_helper_prepare);
  * Zero if everything went ok, nonzero otherwise.
  */
 int drm_fb_helper_init(struct drm_device *dev,
-		       struct drm_fb_helper *fb_helper,
-		       int max_conn_count)
+		       struct drm_fb_helper *fb_helper)
 {
 	int ret;
 
@@ -1322,6 +1326,7 @@ int drm_fb_helper_set_par(struct fb_info *info)
 {
 	struct drm_fb_helper *fb_helper = info->par;
 	struct fb_var_screeninfo *var = &info->var;
+	bool force;
 
 	if (oops_in_progress)
 		return -EBUSY;
@@ -1331,7 +1336,25 @@ int drm_fb_helper_set_par(struct fb_info *info)
 		return -EINVAL;
 	}
 
-	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
+	/*
+	 * Normally we want to make sure that a kms master takes precedence over
+	 * fbdev, to avoid fbdev flickering and occasionally stealing the
+	 * display status. But Xorg first sets the vt back to text mode using
+	 * the KDSET IOCTL with KD_TEXT, and only after that drops the master
+	 * status when exiting.
+	 *
+	 * In the past this was caught by drm_fb_helper_lastclose(), but on
+	 * modern systems where logind always keeps a drm fd open to orchestrate
+	 * the vt switching, this doesn't work.
+	 *
+	 * To not break the userspace ABI we have this special case here, which
+	 * is only used for the above case. Everything else uses the normal
+	 * commit function, which ensures that we never steal the display from
+	 * an active drm master.
+	 */
+	force = var->activate & FB_ACTIVATE_KD_TEXT;
+
+	__drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper, force);
 
 	return 0;
 }
@@ -1357,7 +1380,7 @@ static int pan_display_atomic(struct fb_var_screeninfo *var,
 
 	pan_set(fb_helper, var->xoffset, var->yoffset);
 
-	ret = drm_client_modeset_commit_force(&fb_helper->client);
+	ret = drm_client_modeset_commit_locked(&fb_helper->client);
 	if (!ret) {
 		info->var.xoffset = var->xoffset;
 		info->var.yoffset = var->yoffset;
@@ -2135,7 +2158,7 @@ static int drm_fbdev_client_hotplug(struct drm_client_dev *client)
 
 	drm_fb_helper_prepare(dev, fb_helper, &drm_fb_helper_generic_funcs);
 
-	ret = drm_fb_helper_init(dev, fb_helper, 0);
+	ret = drm_fb_helper_init(dev, fb_helper);
 	if (ret)
 		goto err;
 

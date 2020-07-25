@@ -334,7 +334,7 @@ struct marvell_nand_chip {
 	int addr_cyc;
 	int selected_die;
 	unsigned int nsels;
-	struct marvell_nand_chip_sel sels[0];
+	struct marvell_nand_chip_sel sels[];
 };
 
 static inline struct marvell_nand_chip *to_marvell_nand(struct nand_chip *chip)
@@ -707,7 +707,7 @@ static int marvell_nfc_wait_op(struct nand_chip *chip, unsigned int timeout_ms)
 	 * In case the interrupt was not served in the required time frame,
 	 * check if the ISR was not served or if something went actually wrong.
 	 */
-	if (ret && !pending) {
+	if (!ret && !pending) {
 		dev_err(nfc->dev, "Timeout waiting for RB signal\n");
 		return -ETIMEDOUT;
 	}
@@ -2664,13 +2664,23 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
 		ret = mtd_device_register(mtd, NULL, 0);
 	if (ret) {
 		dev_err(dev, "failed to register mtd device: %d\n", ret);
-		nand_release(chip);
+		nand_cleanup(chip);
 		return ret;
 	}
 
 	list_add_tail(&marvell_nand->node, &nfc->chips);
 
 	return 0;
+}
+
+static void marvell_nand_chips_cleanup(struct marvell_nfc *nfc)
+{
+	struct marvell_nand_chip *entry, *temp;
+
+	list_for_each_entry_safe(entry, temp, &nfc->chips, node) {
+		nand_release(&entry->chip);
+		list_del(&entry->node);
+	}
 }
 
 static int marvell_nand_chips_init(struct device *dev, struct marvell_nfc *nfc)
@@ -2707,21 +2717,16 @@ static int marvell_nand_chips_init(struct device *dev, struct marvell_nfc *nfc)
 		ret = marvell_nand_chip_init(dev, nfc, nand_np);
 		if (ret) {
 			of_node_put(nand_np);
-			return ret;
+			goto cleanup_chips;
 		}
 	}
 
 	return 0;
-}
 
-static void marvell_nand_chips_cleanup(struct marvell_nfc *nfc)
-{
-	struct marvell_nand_chip *entry, *temp;
+cleanup_chips:
+	marvell_nand_chips_cleanup(nfc);
 
-	list_for_each_entry_safe(entry, temp, &nfc->chips, node) {
-		nand_release(&entry->chip);
-		list_del(&entry->node);
-	}
+	return ret;
 }
 
 static int marvell_nfc_init_dma(struct marvell_nfc *nfc)
@@ -2743,16 +2748,21 @@ static int marvell_nfc_init_dma(struct marvell_nfc *nfc)
 	if (ret)
 		return ret;
 
-	nfc->dma_chan =	dma_request_slave_channel(nfc->dev, "data");
-	if (!nfc->dma_chan) {
-		dev_err(nfc->dev,
-			"Unable to request data DMA channel\n");
-		return -ENODEV;
+	nfc->dma_chan =	dma_request_chan(nfc->dev, "data");
+	if (IS_ERR(nfc->dma_chan)) {
+		ret = PTR_ERR(nfc->dma_chan);
+		nfc->dma_chan = NULL;
+		if (ret != -EPROBE_DEFER)
+			dev_err(nfc->dev, "DMA channel request failed: %d\n",
+				ret);
+		return ret;
 	}
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!r)
-		return -ENXIO;
+	if (!r) {
+		ret = -ENXIO;
+		goto release_channel;
+	}
 
 	config.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	config.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
@@ -2763,7 +2773,7 @@ static int marvell_nfc_init_dma(struct marvell_nfc *nfc)
 	ret = dmaengine_slave_config(nfc->dma_chan, &config);
 	if (ret < 0) {
 		dev_err(nfc->dev, "Failed to configure DMA channel\n");
-		return ret;
+		goto release_channel;
 	}
 
 	/*
@@ -2773,12 +2783,20 @@ static int marvell_nfc_init_dma(struct marvell_nfc *nfc)
 	 * the provided buffer.
 	 */
 	nfc->dma_buf = kmalloc(MAX_CHUNK_SIZE, GFP_KERNEL | GFP_DMA);
-	if (!nfc->dma_buf)
-		return -ENOMEM;
+	if (!nfc->dma_buf) {
+		ret = -ENOMEM;
+		goto release_channel;
+	}
 
 	nfc->use_dma = true;
 
 	return 0;
+
+release_channel:
+	dma_release_channel(nfc->dma_chan);
+	nfc->dma_chan = NULL;
+
+	return ret;
 }
 
 static void marvell_nfc_reset(struct marvell_nfc *nfc)
@@ -2920,10 +2938,13 @@ static int marvell_nfc_probe(struct platform_device *pdev)
 
 	ret = marvell_nand_chips_init(dev, nfc);
 	if (ret)
-		goto unprepare_reg_clk;
+		goto release_dma;
 
 	return 0;
 
+release_dma:
+	if (nfc->use_dma)
+		dma_release_channel(nfc->dma_chan);
 unprepare_reg_clk:
 	clk_disable_unprepare(nfc->reg_clk);
 unprepare_core_clk:

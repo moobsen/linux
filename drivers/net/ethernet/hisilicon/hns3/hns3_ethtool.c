@@ -174,18 +174,21 @@ static void hns3_lb_check_skb_data(struct hns3_enet_ring *ring,
 {
 	struct hns3_enet_tqp_vector *tqp_vector = ring->tqp_vector;
 	unsigned char *packet = skb->data;
+	u32 len = skb_headlen(skb);
 	u32 i;
 
-	for (i = 0; i < skb->len; i++)
+	len = min_t(u32, len, HNS3_NIC_LB_TEST_PACKET_SIZE);
+
+	for (i = 0; i < len; i++)
 		if (packet[i] != (unsigned char)(i & 0xff))
 			break;
 
 	/* The packet is correctly received */
-	if (i == skb->len)
+	if (i == HNS3_NIC_LB_TEST_PACKET_SIZE)
 		tqp_vector->rx_group.total_packets++;
 	else
 		print_hex_dump(KERN_ERR, "selftest:", DUMP_PREFIX_OFFSET, 16, 1,
-			       skb->data, skb->len, true);
+			       skb->data, len, true);
 
 	dev_kfree_skb_any(skb);
 }
@@ -736,7 +739,7 @@ static int hns3_check_ksettings_param(const struct net_device *netdev,
 	if (ops->get_media_type)
 		ops->get_media_type(handle, &media_type, &module_type);
 
-	if (cmd->base.duplex != DUPLEX_FULL &&
+	if (cmd->base.duplex == DUPLEX_HALF &&
 	    media_type != HNAE3_MEDIA_TYPE_COPPER) {
 		netdev_err(netdev,
 			   "only copper port supports half duplex!");
@@ -1390,7 +1393,13 @@ static int hns3_set_fecparam(struct net_device *netdev,
 	return ops->set_fec(handle, fec_mode);
 }
 
+#define HNS3_ETHTOOL_COALESCE	(ETHTOOL_COALESCE_USECS |		\
+				 ETHTOOL_COALESCE_USE_ADAPTIVE |	\
+				 ETHTOOL_COALESCE_RX_USECS_HIGH |	\
+				 ETHTOOL_COALESCE_TX_USECS_HIGH)
+
 static const struct ethtool_ops hns3vf_ethtool_ops = {
+	.supported_coalesce_params = HNS3_ETHTOOL_COALESCE,
 	.get_drvinfo = hns3_get_drvinfo,
 	.get_ringparam = hns3_get_ringparam,
 	.set_ringparam = hns3_set_ringparam,
@@ -1416,6 +1425,7 @@ static const struct ethtool_ops hns3vf_ethtool_ops = {
 };
 
 static const struct ethtool_ops hns3_ethtool_ops = {
+	.supported_coalesce_params = HNS3_ETHTOOL_COALESCE,
 	.self_test = hns3_self_test,
 	.get_drvinfo = hns3_get_drvinfo,
 	.get_link = hns3_get_link,

@@ -20,11 +20,11 @@
  * input formats including most variants of RGB and YUV.
  *
  * The hardware has four display pipes, and the layout is a little
- * bit like this:
+ * bit like this::
  *
- * Memory     -> Overlay -> Channel -> FIFO -> 5 formatters -> DSI/DPI
- * External      0..5       0..3       A,B,    3 x DSI         bridge
- * source 0..9                         C0,C1   2 x DPI
+ *   Memory     -> Overlay -> Channel -> FIFO -> 5 formatters -> DSI/DPI
+ *   External      0..5       0..3       A,B,    3 x DSI         bridge
+ *   source 0..9                         C0,C1   2 x DPI
  *
  * FIFOs A and B are for LCD and HDMI while FIFO CO/C1 are for
  * panels with embedded buffer.
@@ -43,6 +43,7 @@
  * to change as we exploit more of the hardware capabilities.
  *
  * TODO:
+ *
  * - Enabled damaged rectangles using drm_plane_enable_fb_damage_clips()
  *   so we can selectively just transmit the damaged area to a
  *   command-only display.
@@ -207,7 +208,6 @@ static int mcde_modeset_init(struct drm_device *drm)
 
 	drm_mode_config_reset(drm);
 	drm_kms_helper_poll_init(drm);
-	drm_fbdev_generic_setup(drm, 32);
 
 	return 0;
 
@@ -273,6 +273,8 @@ static int mcde_drm_bind(struct device *dev)
 	ret = drm_dev_register(drm, 0);
 	if (ret < 0)
 		goto unbind;
+
+	drm_fbdev_generic_setup(drm, 32);
 
 	return 0;
 

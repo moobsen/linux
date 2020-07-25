@@ -1418,14 +1418,17 @@ static netdev_tx_t cxgb4_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 		return adap->uld[CXGB4_ULD_CRYPTO].tx_handler(skb, dev);
 #endif /* CHELSIO_IPSEC_INLINE */
 
+#ifdef CONFIG_CHELSIO_TLS_DEVICE
+	if (skb->decrypted)
+		return adap->uld[CXGB4_ULD_CRYPTO].tx_handler(skb, dev);
+#endif /* CHELSIO_TLS_DEVICE */
+
 	qidx = skb_get_queue_mapping(skb);
 	if (ptp_enabled) {
-		spin_lock(&adap->ptp_lock);
 		if (!(adap->ptp_tx_skb)) {
 			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 			adap->ptp_tx_skb = skb_get(skb);
 		} else {
-			spin_unlock(&adap->ptp_lock);
 			goto out_free;
 		}
 		q = &adap->sge.ptptxq;
@@ -1439,11 +1442,8 @@ static netdev_tx_t cxgb4_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 
 #ifdef CONFIG_CHELSIO_T4_FCOE
 	ret = cxgb_fcoe_offload(skb, adap, pi, &cntrl);
-	if (unlikely(ret == -ENOTSUPP)) {
-		if (ptp_enabled)
-			spin_unlock(&adap->ptp_lock);
+	if (unlikely(ret == -EOPNOTSUPP))
 		goto out_free;
-	}
 #endif /* CONFIG_CHELSIO_T4_FCOE */
 
 	chip_ver = CHELSIO_CHIP_VERSION(adap->params.chip);
@@ -1456,8 +1456,6 @@ static netdev_tx_t cxgb4_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 		dev_err(adap->pdev_dev,
 			"%s: Tx ring %u full while queue awake!\n",
 			dev->name, qidx);
-		if (ptp_enabled)
-			spin_unlock(&adap->ptp_lock);
 		return NETDEV_TX_BUSY;
 	}
 
@@ -1476,8 +1474,6 @@ static netdev_tx_t cxgb4_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 	    unlikely(cxgb4_map_skb(adap->pdev_dev, skb, sgl_sdesc->addr) < 0)) {
 		memset(sgl_sdesc->addr, 0, sizeof(sgl_sdesc->addr));
 		q->mapping_err++;
-		if (ptp_enabled)
-			spin_unlock(&adap->ptp_lock);
 		goto out_free;
 	}
 
@@ -1625,8 +1621,6 @@ static netdev_tx_t cxgb4_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 	txq_advance(&q->q, ndesc);
 
 	cxgb4_ring_tx_db(adap, &q->q, ndesc);
-	if (ptp_enabled)
-		spin_unlock(&adap->ptp_lock);
 	return NETDEV_TX_OK;
 
 out_free:
@@ -2202,6 +2196,9 @@ static void ethofld_hard_xmit(struct net_device *dev,
 	if (unlikely(skip_eotx_wr)) {
 		start = (u64 *)wr;
 		eosw_txq->state = next_state;
+		eosw_txq->cred -= wrlen16;
+		eosw_txq->ncompl++;
+		eosw_txq->last_compl = 0;
 		goto write_wr_headers;
 	}
 
@@ -2357,7 +2354,45 @@ netdev_tx_t t4_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (unlikely(qid >= pi->nqsets))
 		return cxgb4_ethofld_xmit(skb, dev);
 
+	if (is_ptp_enabled(skb, dev)) {
+		struct adapter *adap = netdev2adap(dev);
+		netdev_tx_t ret;
+
+		spin_lock(&adap->ptp_lock);
+		ret = cxgb4_eth_xmit(skb, dev);
+		spin_unlock(&adap->ptp_lock);
+		return ret;
+	}
+
 	return cxgb4_eth_xmit(skb, dev);
+}
+
+static void eosw_txq_flush_pending_skbs(struct sge_eosw_txq *eosw_txq)
+{
+	int pktcount = eosw_txq->pidx - eosw_txq->last_pidx;
+	int pidx = eosw_txq->pidx;
+	struct sk_buff *skb;
+
+	if (!pktcount)
+		return;
+
+	if (pktcount < 0)
+		pktcount += eosw_txq->ndesc;
+
+	while (pktcount--) {
+		pidx--;
+		if (pidx < 0)
+			pidx += eosw_txq->ndesc;
+
+		skb = eosw_txq->desc[pidx].skb;
+		if (skb) {
+			dev_consume_skb_any(skb);
+			eosw_txq->desc[pidx].skb = NULL;
+			eosw_txq->inuse--;
+		}
+	}
+
+	eosw_txq->pidx = eosw_txq->last_pidx + 1;
 }
 
 /**
@@ -2435,9 +2470,11 @@ int cxgb4_ethofld_send_flowc(struct net_device *dev, u32 eotid, u32 tc)
 					    FW_FLOWC_MNEM_EOSTATE_CLOSING :
 					    FW_FLOWC_MNEM_EOSTATE_ESTABLISHED);
 
-	eosw_txq->cred -= len16;
-	eosw_txq->ncompl++;
-	eosw_txq->last_compl = 0;
+	/* Free up any pending skbs to ensure there's room for
+	 * termination FLOWC.
+	 */
+	if (tc == FW_SCHED_CLS_NONE)
+		eosw_txq_flush_pending_skbs(eosw_txq);
 
 	ret = eosw_txq_enqueue(eosw_txq, skb);
 	if (ret) {
@@ -2690,6 +2727,7 @@ static void ofldtxq_stop(struct sge_uld_txq *q, struct fw_wr_hdr *wr)
  *	is ever running at a time ...
  */
 static void service_ofldq(struct sge_uld_txq *q)
+	__must_hold(&q->sendq.lock)
 {
 	u64 *pos, *before, *end;
 	int credits;
@@ -3262,7 +3300,7 @@ static noinline int t4_systim_to_hwstamp(struct adapter *adapter,
 
 	hwtstamps = skb_hwtstamps(skb);
 	memset(hwtstamps, 0, sizeof(*hwtstamps));
-	hwtstamps->hwtstamp = ns_to_ktime(be64_to_cpu(*((u64 *)data)));
+	hwtstamps->hwtstamp = ns_to_ktime(get_unaligned_be64(data));
 
 	return RX_PTP_PKT_SUC;
 }
