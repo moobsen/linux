@@ -1,5 +1,5 @@
 #!/bin/bash
 
-cd ..
+cd ../../
 sudo dpkg -i linux-*.deb
 mv linux-*-moobsen* ./linux_build/
