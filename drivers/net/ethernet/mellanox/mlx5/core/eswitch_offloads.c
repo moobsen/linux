@@ -382,6 +382,9 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 		flow_act.modify_hdr = attr->modify_hdr;
 
 	if (split) {
+		if (MLX5_CAP_ESW_FLOWTABLE(esw->dev, flow_source) &&
+		    attr->in_rep->vport == MLX5_VPORT_UPLINK)
+			spec->flow_context.flow_source = MLX5_FLOW_CONTEXT_FLOW_SOURCE_UPLINK;
 		fdb = esw_vport_tbl_get(esw, attr);
 	} else {
 		if (attr->chain || attr->prio)

@@ -524,7 +524,6 @@ static bool whole_page(struct mce *m)
 {
 	if (!mca_cfg.ser || !(m->status & MCI_STATUS_MISCV))
 		return true;
-
 	return MCI_MISC_ADDR_LSB(m->misc) >= PAGE_SHIFT;
 }
 

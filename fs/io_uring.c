@@ -4599,6 +4599,7 @@ static bool io_poll_remove_one(struct io_kiocb *req)
 	io_poll_remove_double(req);
 
 	if (req->opcode == IORING_OP_POLL_ADD) {
+		io_poll_remove_double(req, req->io);
 		do_complete = __io_poll_remove_one(req, &req->poll);
 	} else {
 		struct async_poll *apoll = req->apoll;
