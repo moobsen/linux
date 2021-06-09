@@ -7,4 +7,4 @@ cd $(git rev-parse --show-toplevel)
 rm -rf ./debian
 rm linux-*.tar.gz
 rm vmlinux-gdb.py
-time make -j 16 deb-pkg LOCALVERSION=-moobsen
+time make -j 32 deb-pkg LOCALVERSION=-moobsen
